@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -69,6 +70,7 @@ struct Device {
     uint64_t others0 = 0;              // what every process had written at this process's first reading
     uint64_t own0 = 0;                 // what this process held then
     bool commit_told = false;          // the log has said once that the commit limit binds
+    bool uma_told = false;             // the log has said once that Linux unified-memory sizing is on
 };
 
 constexpr int kMaxDevices = 64;
@@ -143,6 +145,44 @@ cudaError_t device_mem_reading(DeviceMemoryReading& r) {
         r.device_free = D - used;
         r.total = D;
     }
+#ifndef _WIN32
+    // GB10 / DGX Spark: a Linux integrated GPU where NVML reports no carve-out (dedicated == 0).
+    //
+    // cudaMemGetInfo's free here is only the memory the driver can hand out *this instant*.  On a unified-memory
+    // SoC its "used" includes the page cache - ordinary system RAM that a CUDA allocation can reclaim - so with
+    // 118 GiB of MemAvailable the reading can be as low as 13 GiB.  The expert cache is then sized to zero, the
+    // RAM-resident tier cannot open, and the start stops with "no VRAM is left for the expert cache".
+    //
+    // Size from the OS's available memory instead (the same reading the RAM tiers use), less a small headroom
+    // for the driver's own bookkeeping.  --vram-reserve-mib still applies on top of this.
+    //   BASALT_UMA_CF=0        keep cudaMemGetInfo's original reading (the pre-patch behaviour)
+    //   BASALT_UMA_CAP_GIB=N   cap the reported free at N GiB, to size a deliberately smaller expert cache
+    if (d.model.integrated && d.model.dedicated == 0) {
+        const char* off = std::getenv("BASALT_UMA_CF");
+        if (off == nullptr || std::strcmp(off, "0") != 0) {
+            const uint64_t avail = platform::available_memory();
+            constexpr uint64_t kDriverHeadroom = 2ull << 30;
+            uint64_t usable = avail > kDriverHeadroom ? avail - kDriverHeadroom : 0;
+            if (const char* cap = std::getenv("BASALT_UMA_CAP_GIB")) {
+                const unsigned long long n = std::strtoull(cap, nullptr, 10);
+                if (n > 0) usable = std::min<uint64_t>(usable, (uint64_t) n << 30);
+            }
+            if (r.total > 0) usable = std::min<uint64_t>(usable, r.total);
+            if (usable > r.device_free) {
+                if (!d.uma_told) {
+                    d.uma_told = true;
+                    constexpr double GiB = 1073741824.0;
+                    basalt::log::info("basalt",
+                                      "device memory: Linux unified memory without an NVML carve-out: cudaMemGetInfo "
+                                      "reports %.2f GiB free, but %.2f GiB of system RAM is available; the expert "
+                                      "cache is sized from the latter (BASALT_UMA_CF=0 restores the driver reading)",
+                                      (double) r.device_free / GiB, (double) usable / GiB);
+                }
+                r.device_free = usable;
+            }
+        }
+    }
+#endif
     // The OS charges device memory to the commit limit: past it nothing more is allocated, carve-out or not.  What the
     // RAM tiers leave of the RAM, the device leaves of the commit: the reserve the RAM guard holds, plus what the engine
     // takes after its plan (plan_reserve), so the settled headroom is above the guard and not on it.
